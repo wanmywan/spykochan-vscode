@@ -228,10 +228,14 @@ install_build_tools() {
 compile_hook() {
   header "HOOK LIBRARY COMPILATION"
   
+  # Get the directory where the script is located
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  LOCAL_HOOK="${SCRIPT_DIR}/hook/vscode.c"
+
   # Use local file if available, otherwise download
-  if [ -f "./hook/vscode.c" ]; then
+  if [ -f "$LOCAL_HOOK" ]; then
     step "Using local hook source code..."
-    cp "./hook/vscode.c" "/tmp/vscode.c"
+    cp "$LOCAL_HOOK" "/tmp/vscode.c"
   else
     step "Downloading hook source code..."
     progress "Source: github.com/wooxsec/spykochan-vscode"
@@ -243,10 +247,10 @@ compile_hook() {
   fi
   
   if [ ! -f /tmp/vscode.c ] || [ ! -s /tmp/vscode.c ]; then
-    err "Downloaded file is empty or missing"
+    err "Downloaded/Copied file is empty or missing"
     exit 1
   fi
-  ok "Source code downloaded: vscode.c ($(stat -f%z /tmp/vscode.c 2>/dev/null || stat -c%s /tmp/vscode.c) bytes)"
+  ok "Source code ready: vscode.c ($(stat -f%z /tmp/vscode.c 2>/dev/null || stat -c%s /tmp/vscode.c) bytes)"
   
   step "Compiling shared library..."
   progress "Architecture: $(uname -m)"
@@ -254,10 +258,10 @@ compile_hook() {
   progress "Command: gcc -fPIC -shared -o /tmp/hook.so /tmp/vscode.c -ldl"
   
   # Compile with error output
-  if ! gcc -fPIC -shared -o /tmp/hook.so /tmp/vscode.c -ldl 2>&1; then
+  if ! gcc -fPIC -shared -o /tmp/hook.so /tmp/vscode.c -ldl 2>&1 | tee /tmp/compiler_output.txt > /dev/null; then
     err "Compilation failed"
     info "Showing compiler errors:"
-    gcc -fPIC -shared -o /tmp/hook.so /tmp/vscode.c -ldl
+    cat /tmp/compiler_output.txt
     exit 1
   fi
   
