@@ -85,10 +85,14 @@ static int check_process_name(const char *pid_str) {
     snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
     fd = open(path, O_RDONLY);
     if (fd != -1) {
-        char cmdline[256];
+        char cmdline[1024];
         ssize_t n = read(fd, cmdline, sizeof(cmdline)-1);
         close(fd);
         if (n > 0) {
+            cmdline[n] = '\0';
+            for (ssize_t i = 0; i < n; i++) {
+                if (cmdline[i] == '\0') cmdline[i] = ' ';
+            }
             if (strstr(cmdline, "vscode-server") != NULL) return 1;
             if (strstr(cmdline, "code-server") != NULL) return 1;
             if (strstr(cmdline, "code-tunnel") != NULL) return 1;
