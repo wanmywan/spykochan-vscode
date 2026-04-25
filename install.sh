@@ -301,6 +301,14 @@ test_hook() {
   export LD_PRELOAD=/tmp/hook.so
   ok "LD_PRELOAD configured: /tmp/hook.so"
 
+  # Fix SELinux context if needed for the test hook
+  if command -v getenforce &> /dev/null; then
+    if [ "$(getenforce)" != "Disabled" ]; then
+      progress "Applying SELinux context to test hook..."
+      chcon -t textrel_shlib_t /tmp/hook.so 2>/dev/null || true
+    fi
+  fi
+
   step "Creating test target directory..."
   mkdir -p /tmp/vscode
   if [ -d /tmp/vscode ]; then
