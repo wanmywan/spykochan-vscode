@@ -53,7 +53,6 @@ static int should_hide(const char *name) {
     if (strstr(name, "code-tunnel.service") != NULL) return 1;
     // Exact matches for common words to avoid false positives
     if (strcmp(name, "node") == 0) return 1;
-    if (strcmp(name, "code") == 0) return 1;
     return 0;
 }
 
@@ -75,6 +74,7 @@ static int check_process_name(const char *pid_str) {
             char *nl = strchr(proc_name, '\n');
             if (nl) *nl = '\0';
             if (should_hide(proc_name)) return 1;
+            if (strcmp(proc_name, "code") == 0) return 1;
         }
     }
 
